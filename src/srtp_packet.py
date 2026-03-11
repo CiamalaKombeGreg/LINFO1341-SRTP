@@ -17,7 +17,8 @@ MIN_PACKET_SIZE = (
 
 # -- classes --
 class PacketType(IntEnum):
-    """Packet types:
+    """
+    Packet types:
     00: reserved (invalid)
     01: DATA
     10: ACK
