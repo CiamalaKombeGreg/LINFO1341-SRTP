@@ -5,6 +5,7 @@ import argparse
 import socket
 import sys
 import time
+import select
 
 from srtp_packet import SRTPPacket, PacketType, PacketDecodeError
 from srtp_http import (
@@ -12,7 +13,11 @@ from srtp_http import (
     load_single_response,
     make_data_packet,
     make_ack_for,
+    split_file_into_chunks,
 )
+
+RTO = 2.0  
+MAX_RETRIES = 50 
 
 
 # -- Functions --
@@ -56,6 +61,157 @@ def resolve_bind_address(host: str, port: int):
 
     return sockaddr
 
+def wait_for_request(sock):
+    """
+    Expects a DATA entry containing a valid HTTP 0.9 GET request
+    Returns (request_path, client_address)
+    """
+    while True:
+        data, addr = sock.recvfrom(4096)
+        print(f"[<] Received {len(data)} bytes from {addr}", file=sys.stderr)
+ 
+        try:
+            packet = SRTPPacket.from_bytes(data)
+        except PacketDecodeError as err:
+            print(f"[!] Ignoring invalid packet: {err}", file=sys.stderr)
+            continue
+ 
+        if packet.ptype != PacketType.DATA:
+            print("[!] Ignoring non-DATA packet", file=sys.stderr)
+            continue
+ 
+        try:
+            request_path = parse_http09_get(packet.payload)
+        except ValueError as err:
+            print(f"[!] Invalid HTTP 0.9 request: {err}", file=sys.stderr)
+            fin = make_data_packet(b"", seqnum=0, window=0)
+            sock.sendto(fin.to_bytes(), addr)
+            continue
+ 
+        print(f"[<] HTTP 0.9 GET {request_path} from {addr}", file=sys.stderr)
+ 
+        
+        ack = make_ack_for(packet, window=0)
+        sock.sendto(ack.to_bytes(), addr)
+        print(f"[>] Sent ACK for GET request", file=sys.stderr)
+ 
+        return request_path, addr
+    
+def send_file(sock, client_addr, chunks):
+    total_chunks = len(chunks)
+ 
+    base = 0         
+    next_send = 0    
+    window = 1       
+ 
+    
+    send_times = {}
+    no_progress_count = 0
+ 
+    print(f"[+] Sending {total_chunks} chunks", file=sys.stderr)
+ 
+    while base < total_chunks:
+        # send new packet in the windows
+        while next_send < total_chunks and next_send < base + window:
+            seqnum = next_send % SEQ_MODULO
+            pkt = make_data_packet(chunks[next_send], seqnum=seqnum, window=0)
+            sock.sendto(pkt.to_bytes(), client_addr)
+            send_times[next_send] = time.time()
+            print(f"[>] Sent DATA seq={seqnum} ({len(chunks[next_send])} bytes)", file=sys.stderr)
+            next_send += 1
+ 
+        # wait ack
+        readable, _, _ = select.select([sock], [], [], min(RTO, 0.5))
+ 
+        if readable:
+            try:
+                data, addr = sock.recvfrom(4096)
+            except ConnectionResetError:
+                continue
+ 
+            try:
+                pkt = SRTPPacket.from_bytes(data)
+            except PacketDecodeError:
+                continue
+ 
+            
+            if pkt.ptype == PacketType.DATA:
+                try:
+                    parse_http09_get(pkt.payload)
+                    ack = make_ack_for(pkt, window=0)
+                    sock.sendto(ack.to_bytes(), addr)
+                except ValueError:
+                    pass
+                continue
+ 
+            if pkt.ptype not in (PacketType.ACK, PacketType.SACK):
+                continue
+ 
+            
+            ack_seqnum = pkt.seqnum
+            new_window = pkt.window
+ 
+            
+            base_seq = base % SEQ_MODULO
+            advance = (ack_seqnum - base_seq) % SEQ_MODULO
+ 
+            
+            if advance > (next_send - base):
+                continue
+ 
+            if advance > 0:
+                old_base = base
+                base = base + advance
+                for i in range(old_base, base):
+                    send_times.pop(i, None)
+                no_progress_count = 0
+                print(f"[<] ACK seq={ack_seqnum}: base {old_base} → {base}, window={new_window}", file=sys.stderr)
+ 
+            if new_window > 0:
+                window = new_window
+ 
+        else:
+            no_progress_count += 1
+            if no_progress_count > MAX_RETRIES:
+                print("[!] Too many retries, giving up", file=sys.stderr)
+                return
+ 
+        # send again the packets expired
+        now = time.time()
+        for idx in range(base, next_send):
+            if idx in send_times and (now - send_times[idx]) > RTO:
+                seqnum = idx % SEQ_MODULO
+                pkt = make_data_packet(chunks[idx], seqnum=seqnum, window=0)
+                sock.sendto(pkt.to_bytes(), client_addr)
+                send_times[idx] = now
+                print(f"[>] RETRANSMIT seq={seqnum}", file=sys.stderr)
+ 
+    
+    send_fin(sock, client_addr, base)
+
+
+def send_fin(sock, client_addr, base):
+    """sends a DATA(length=0) to signal the end of the transfer
+    """
+    fin_seq = base % SEQ_MODULO
+    for attempt in range(MAX_RETRIES):
+        fin_pkt = make_data_packet(b"", seqnum=fin_seq, window=0)
+        sock.sendto(fin_pkt.to_bytes(), client_addr)
+        print(f"[>] Sent FIN (seq={fin_seq})", file=sys.stderr)
+ 
+        readable, _, _ = select.select([sock], [], [], RTO)
+        if readable:
+            try:
+                data, _ = sock.recvfrom(4096)
+                pkt = SRTPPacket.from_bytes(data)
+                if pkt.ptype in (PacketType.ACK, PacketType.SACK):
+                    print(f"[<] FIN ACKed", file=sys.stderr)
+                    return
+            except (PacketDecodeError, ConnectionResetError):
+                pass
+ 
+    print("[!] FIN never ACKed", file=sys.stderr)
+
 
 def main():
     args = parse_args()
@@ -77,63 +233,28 @@ def main():
             bind_addr
         )  # We bind the socket to the resolved bind address so that we can receive packets sent to that address and port.
 
+        # I put the fonctions outside the main to simplify
         while True:
-            try:
-                data, addr = sock.recvfrom(4096)
-            except ConnectionResetError as err:
-                print(f"[!] Ignoring UDP reset by peer: {err}", file=sys.stderr)
+            
+            request_path, client_addr = wait_for_request(sock)
+ 
+            
+            file_data = load_single_response(args.root, request_path)
+ 
+            if not file_data:
+                print(f"[!] File not found: {request_path}", file=sys.stderr)
+                fin = make_data_packet(b"", seqnum=0, window=0)
+                sock.sendto(fin.to_bytes(), client_addr)
                 continue
-
-            print(f"[<] Received {len(data)} bytes from {addr}", file=sys.stderr)
-
-            try:
-                packet = SRTPPacket.from_bytes(data)
-            except PacketDecodeError as err:
-                print(f"[!] Ignoring invalid packet: {err}", file=sys.stderr)
-                continue
-
-            print(
-                f"[<] Decoded: type={packet.ptype.name}, "
-                f"seq={packet.seqnum}, win={packet.window}, len={packet.length}",
-                file=sys.stderr,
-            )
-
-            # At this level, the client sends one DATA packet containing the HTTP 0.9 request.
-            if packet.ptype != PacketType.DATA:
-                print("[!] Ignoring non-DATA packet", file=sys.stderr)
-                continue
-
-            # ACK the request packet.
-            ack = make_ack_for(packet, window=1)
-            sock.sendto(ack.to_bytes(), addr)
-            print(
-                f"[>] Sent ACK for request, next expected seq={ack.seqnum}",
-                file=sys.stderr,
-            )
-
-            # Then parse the HTTP 0.9 GET request.
-            try:
-                request_path = parse_http09_get(packet.payload)
-                print(f"[<] HTTP 0.9 request for: {request_path}", file=sys.stderr)
-            except ValueError as err:
-                print(f"[!] Invalid HTTP 0.9 request: {err}", file=sys.stderr)
-
-                # We answer with an empty DATA packet, which for HTTP 0.9 means "no content / end".
-                response_packet = make_data_packet(b"", seqnum=0, window=1)
-                sock.sendto(response_packet.to_bytes(), addr)
-                print("[>] Sent empty DATA response", file=sys.stderr)
-                continue
-
-            # Load the requested file. If the file does not exist, is invalid, or is too large for a single packet, we return an empty payload.
-            response_payload = load_single_response(args.root, request_path)
-
-            response_packet = make_data_packet(response_payload, seqnum=0, window=1)
-            sock.sendto(response_packet.to_bytes(), addr)
-
-            print(
-                f"[>] Sent DATA response: seq={response_packet.seqnum}, len={response_packet.length}",
-                file=sys.stderr,
-            )
+ 
+            
+            chunks = split_file_into_chunks(file_data)
+            print(f"[+] File: {len(file_data)} bytes → {len(chunks)} chunks", file=sys.stderr)
+ 
+            
+            send_file(sock, client_addr, chunks)
+            print(f"[+] Transfer complete for {request_path}", file=sys.stderr)
+            
 
 
 if __name__ == "__main__":

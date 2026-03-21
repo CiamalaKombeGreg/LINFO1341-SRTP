@@ -14,7 +14,14 @@ from srtp_http import (
     build_http09_get,
     make_data_packet,
     make_ack_for,
+    make_ack,       
+    seq_in_window,  
+    seq_add,   
 )
+
+
+RECV_BUFFER_SIZE = 32  
+TIMEOUT = 5.0 
 
 
 # -- Functions --
@@ -60,6 +67,126 @@ def resolve_target(host: str, port: int):
 
     return sockaddr
 
+def send_request(sock, dest, request_path):
+    """
+    Sends the HTTP 0.9 request and waits for the server ACK
+    Retransmits if there is no response. Returns True if ACKed
+    """
+    request_payload = build_http09_get(request_path)
+    request_packet = make_data_packet(request_payload, seqnum=0, window=RECV_BUFFER_SIZE)
+    raw_request = request_packet.to_bytes()
+ 
+    for attempt in range(10):
+        sock.sendto(raw_request, dest)
+        print(f"[>] Sent GET {request_path} (attempt {attempt + 1})", file=sys.stderr)
+ 
+        readable, _, _ = select.select([sock], [], [], TIMEOUT)
+        if not readable:
+            print("[!] Timeout, retransmitting...", file=sys.stderr)
+            continue
+ 
+        try:
+            data, addr = sock.recvfrom(4096)
+            pkt = SRTPPacket.from_bytes(data)
+        except (PacketDecodeError, ConnectionResetError):
+            continue
+ 
+        if pkt.ptype in (PacketType.ACK, PacketType.SACK):
+            print(f"[<] Request ACKed", file=sys.stderr)
+            return True
+ 
+        
+        if pkt.ptype == PacketType.DATA:
+            print("[<] Server already sending data", file=sys.stderr)
+            return True
+ 
+    print("[!] Request never acknowledged", file=sys.stderr)
+    return False
+
+def receive_file(sock, dest):
+    """
+    Receiving the file with selective repeat
+    """
+    expected_seq = 0
+    buffer = {}               
+    assembled = bytearray()   
+    last_timestamp = b"\x00\x00\x00\x00"
+ 
+    stall_count = 0
+ 
+    while True:
+        readable, _, _ = select.select([sock], [], [], TIMEOUT)
+ 
+        if not readable:
+            stall_count += 1
+            if stall_count > 30:
+                print("[!] Transfer stalled, giving up", file=sys.stderr)
+                return bytes(assembled) if assembled else b""
+ 
+            # send again the last ack if the server didn't receive it
+            free = RECV_BUFFER_SIZE - len(buffer)
+            ack = make_ack(expected_seq, window=free, timestamp=last_timestamp)
+            sock.sendto(ack.to_bytes(), dest)
+            continue
+ 
+        stall_count = 0
+ 
+        try:
+            data, addr = sock.recvfrom(4096)
+            pkt = SRTPPacket.from_bytes(data)
+        except (PacketDecodeError, ConnectionResetError):
+            continue
+ 
+        if pkt.ptype != PacketType.DATA:
+            continue
+ 
+        last_timestamp = pkt.timestamp
+        seq = pkt.seqnum
+ 
+        # detect the end
+        if pkt.length == 0:
+            if seq == expected_seq % SEQ_MODULO:
+                print(f"[<] FIN received, transfer complete", file=sys.stderr)
+                fin_ack = make_ack(seq_add(seq, 1), window=RECV_BUFFER_SIZE, timestamp=last_timestamp)
+                
+                for _ in range(3):
+                    sock.sendto(fin_ack.to_bytes(), dest)
+                return bytes(assembled)
+            continue
+ 
+        # check if the packet is in the window
+        exp_mod = expected_seq % SEQ_MODULO
+        if not seq_in_window(seq, exp_mod, RECV_BUFFER_SIZE):
+            
+            
+            free = RECV_BUFFER_SIZE - len(buffer)
+            ack = make_ack(exp_mod, window=free, timestamp=last_timestamp)
+            sock.sendto(ack.to_bytes(), dest)
+            continue
+ 
+        
+        if seq == exp_mod:
+            assembled.extend(pkt.payload)
+            expected_seq += 1
+ 
+            
+            while (expected_seq % SEQ_MODULO) in buffer:
+                assembled.extend(buffer.pop(expected_seq % SEQ_MODULO))
+                expected_seq += 1
+ 
+        
+        elif seq not in buffer:
+            buffer[seq] = pkt.payload
+ 
+        
+        free = RECV_BUFFER_SIZE - len(buffer)
+        ack = make_ack(expected_seq, window=free, timestamp=last_timestamp)
+        sock.sendto(ack.to_bytes(), dest)
+        print(
+            f"[<] seq={seq} | expected={exp_mod} | assembled={len(assembled)} | buffered={len(buffer)}",
+            file=sys.stderr,
+        )
+
 
 def save_response(path: str, payload: bytes):
     """
@@ -80,79 +207,22 @@ def main():
         print(f"[!] Invalid URL/destination: {err}", file=sys.stderr)
         sys.exit(1)
 
-    # In HTTP 0.9, the client sends: GET /path in ASCII, without headers.
-    request_payload = build_http09_get(request_path)
-
-    # We send one SRTP DATA packet containing the whole request.
-    request_packet = make_data_packet(request_payload, seqnum=0, window=1)
-    raw_request = request_packet.to_bytes()
-
     print(f"[+] Destination: {dest}", file=sys.stderr)
     print(f"[+] Request path: {request_path}", file=sys.stderr)
-    print(
-        f"[>] Sending request: type={request_packet.ptype.name}, seq={request_packet.seqnum}, len={request_packet.length}",
-        file=sys.stderr,
-    )
-
-    response_saved = False  # We use this flag to track whether we have already saved the response to disk, so that we don't save it multiple times if we receive multiple packets.
-
     with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(
-            args.timeout
-        )  # We set the default or selected timeout for receiving a response from the server.
+ 
+        # send the request GET
+        if not send_request(sock, dest, request_path):
+            sys.exit(1)
+ 
+        # receive the file 
+        file_data = receive_file(sock, dest)
+ 
+        Path(args.save).write_bytes(file_data)
+        print(f"[+] Saved {len(file_data)} bytes to {args.save}", file=sys.stderr)
+ 
+    
 
-        sock.sendto(
-            raw_request, dest
-        )  # Sent the raw bytes of the request packet to the server using the resolved sockaddr.
-        while not response_saved:
-            try:
-                data, addr = sock.recvfrom(
-                    4096
-                )  # We wait for a response from the server. 4096 bytes is the maximum size of the buffer we will read from the socket.
-            except socket.timeout:
-                print("[!] Timeout: no response received", file=sys.stderr)
-                sys.exit(1)
-
-            print(f"[<] Received {len(data)} bytes from {addr}", file=sys.stderr)
-
-            try:
-                reply = SRTPPacket.from_bytes(data)
-            except PacketDecodeError as err:
-                print(f"[!] Invalid SRTP response: {err}", file=sys.stderr)
-                sys.exit(1)
-
-            print(
-                f"[<] Decoded response: type={reply.ptype.name}, seq={reply.seqnum}, win={reply.window}, len={reply.length}",
-                file=sys.stderr,
-            )
-
-            if reply.ptype == PacketType.ACK:
-                # The ACK confirms that the server received our request packet.
-                print("[<] Request acknowledged by server", file=sys.stderr)
-                continue  # We continue waiting for the DATA packet that contains the file content.
-
-            elif reply.ptype == PacketType.DATA:
-                # The DATA packet contains the file content.
-                print("[<] Received DATA packet", file=sys.stderr)
-            else:
-                print("[!] Ignoring non-DATA, non-ACK packet", file=sys.stderr)
-                continue  # We ignore any other type of packet, as we only expect ACKs and DATA packets from the server in response to our request.
-
-            # Save the file content.
-            save_response(args.save, reply.payload)
-            response_saved = True
-
-            print(
-                f"[+] Saved {len(reply.payload)} bytes to {args.save}", file=sys.stderr
-            )
-
-            # ACK the DATA packet we just received.
-            ack = make_ack_for(reply, window=1)
-            sock.sendto(ack.to_bytes(), dest)
-            print(
-                f"[>] Sent ACK for received DATA, next expected seq={ack.seqnum}",
-                file=sys.stderr,
-            )
 
 
 if __name__ == "__main__":
