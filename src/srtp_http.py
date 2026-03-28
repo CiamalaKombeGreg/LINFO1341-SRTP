@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from srtp_packet import SRTPPacket, PacketType
+from srtp_packet import SRTPPacket, PacketType, MAX_PAYLOAD_SIZE
 
 
 # -- Constants --
@@ -29,6 +29,23 @@ def next_seqnum(seqnum: int) -> int:
     """
     return (seqnum + 1) % SEQ_MODULO
 
+def seq_add(seqnum: int, offset: int) -> int:
+    """to progress in the circular space"""
+    return (seqnum + offset) % SEQ_MODULO
+
+
+def seq_in_window(seqnum: int, base: int, window_size: int) -> bool:
+    """
+    Check if the seqnum is in the windows. The client use it to decides if it accepts
+    or not the packets
+    """
+    if window_size <= 0:
+        return False
+    distance = (seqnum - base) % SEQ_MODULO
+    return distance < window_size
+
+
+
 
 def make_data_packet(payload: bytes, seqnum: int = 0, window: int = 1) -> SRTPPacket:
     """
@@ -37,7 +54,7 @@ def make_data_packet(payload: bytes, seqnum: int = 0, window: int = 1) -> SRTPPa
     return SRTPPacket(
         ptype=PacketType.DATA,
         window=window,
-        seqnum=seqnum,
+        seqnum=seqnum % SEQ_MODULO,
         timestamp=make_timestamp(),
         payload=payload,
     )
@@ -58,6 +75,27 @@ def make_ack_for(packet: SRTPPacket, window: int = 1) -> SRTPPacket:
         timestamp=packet.timestamp,
         payload=b"",
     )
+
+def make_ack(seqnum: int, window: int, timestamp: bytes) -> SRTPPacket:
+    """
+    Creates an ACK without an input DATA packet
+    Required in receive_file() when the client needs to ACK without a source packet
+    """
+    return SRTPPacket(
+        ptype=PacketType.ACK,
+        window=window,
+        seqnum=seqnum % SEQ_MODULO,
+        timestamp=timestamp,
+        payload=b"",
+    )
+
+def split_file_into_chunks(data: bytes, chunk_size: int = MAX_PAYLOAD_SIZE) -> list:
+    """Splits a file into blocks of up to 1024 bytes
+        Each block will become the payload of a DATA packet
+    """
+    if not data:
+        return []
+    return [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
 
 
 # -- HTTP 0.9 functions --
@@ -156,7 +194,10 @@ def load_single_response(root: str, request_path: str) -> bytes:
 
     content = file_path.read_bytes()
 
+    #why this condition ? 
+    """
     if len(content) > MAX_SINGLE_RESPONSE:
         return b""
+    """
 
     return content
