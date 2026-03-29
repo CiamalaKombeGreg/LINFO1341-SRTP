@@ -15,6 +15,8 @@ from srtp_http import (
     make_ack_for,
     split_file_into_chunks,
     SEQ_MODULO,
+    decode_sack_payload,
+
 )
 
 RTO = 2.0  
@@ -107,6 +109,7 @@ def send_file(sock, client_addr, chunks):
  
     
     send_times = {}
+    sacked = set()
     no_progress_count = 0
  
     print(f"[+] Sending {total_chunks} chunks", file=sys.stderr)
@@ -165,8 +168,20 @@ def send_file(sock, client_addr, chunks):
                 base = base + advance
                 for i in range(old_base, base):
                     send_times.pop(i, None)
+                    sacked.discard(i)
                 no_progress_count = 0
                 print(f"[<] ACK seq={ack_seqnum}: base {old_base} → {base}, window={new_window}", file=sys.stderr)
+
+            if pkt.ptype == PacketType.SACK and pkt.length > 0:
+                sack_seqnums = decode_sack_payload(pkt.payload)
+                for sack_seq in sack_seqnums:
+                    
+                    distance = (sack_seq - (base % SEQ_MODULO)) % SEQ_MODULO
+                    logical_idx = base + distance
+                    if base <= logical_idx < next_send:
+                        sacked.add(logical_idx)
+                        send_times.pop(logical_idx, None)  
+                print(f"    SACK: {len(sack_seqnums)} paquets hors-séquence déjà reçus", file=sys.stderr)
  
             if new_window > 0:
                 window = new_window
@@ -180,6 +195,8 @@ def send_file(sock, client_addr, chunks):
         # send again the packets expired
         now = time.time()
         for idx in range(base, next_send):
+            if idx in sacked:
+                continue  
             if idx in send_times and (now - send_times[idx]) > RTO:
                 seqnum = idx % SEQ_MODULO
                 pkt = make_data_packet(chunks[idx], seqnum=seqnum, window=0)

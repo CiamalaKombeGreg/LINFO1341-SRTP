@@ -18,7 +18,8 @@ from srtp_http import (
     make_ack,       
     seq_in_window,  
     seq_add,  
-    SEQ_MODULO 
+    SEQ_MODULO,
+    make_sack,
 )
 
 
@@ -127,7 +128,7 @@ def receive_file(sock, dest):
  
             # send again the last ack if the server didn't receive it
             free = RECV_BUFFER_SIZE - len(buffer)
-            ack = make_ack(expected_seq, window=free, timestamp=last_timestamp)
+            ack = make_sack(expected_seq, window=free, timestamp=last_timestamp, out_of_order=list(buffer.keys()))
             sock.sendto(ack.to_bytes(), dest)
             continue
  
@@ -162,7 +163,7 @@ def receive_file(sock, dest):
             
             
             free = RECV_BUFFER_SIZE - len(buffer)
-            ack = make_ack(exp_mod, window=free, timestamp=last_timestamp)
+            ack = make_sack(exp_mod, window=free, timestamp=last_timestamp, out_of_order=list(buffer.keys()))
             sock.sendto(ack.to_bytes(), dest)
             continue
  
@@ -182,7 +183,7 @@ def receive_file(sock, dest):
  
         
         free = RECV_BUFFER_SIZE - len(buffer)
-        ack = make_ack(expected_seq, window=free, timestamp=last_timestamp)
+        ack = make_sack(expected_seq, window=free, timestamp=last_timestamp, out_of_order=list(buffer.keys()))
         sock.sendto(ack.to_bytes(), dest)
         print(
             f"[<] seq={seq} | expected={exp_mod} | assembled={len(assembled)} | buffered={len(buffer)}",

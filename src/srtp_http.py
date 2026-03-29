@@ -89,6 +89,75 @@ def make_ack(seqnum: int, window: int, timestamp: bytes) -> SRTPPacket:
         payload=b"",
     )
 
+def encode_sack_payload(out_of_order_seqnums: list) -> bytes:
+    """
+    Encode a seqnum list out of sequence
+ 
+    """
+    if not out_of_order_seqnums:
+        return b""
+ 
+    # Concatenate all sequences into a bitstream
+    bit_string = ""
+    for seq in out_of_order_seqnums:
+        bit_string += format(seq & 0x7FF, "011b") 
+ 
+    
+    remainder = len(bit_string) % 32
+    if remainder != 0:
+        bit_string += "0" * (32 - remainder)
+ 
+    
+    payload = bytearray()
+    for i in range(0, len(bit_string), 8):
+        payload.append(int(bit_string[i : i + 8], 2))
+ 
+    return bytes(payload)
+ 
+ 
+def decode_sack_payload(payload: bytes, count_hint: int = -1) -> list:
+    """
+    Decodes the payload of a SACK packet into a list of sequences
+    The sequences are read 11 bits at a time
+    """
+    if not payload:
+        return []
+ 
+    bit_string = ""
+    for byte in payload:
+        bit_string += format(byte, "08b")
+ 
+    seqnums = []
+    total_bits = len(bit_string)
+    max_seqnums = total_bits // 11 
+ 
+    for i in range(max_seqnums):
+        start = i * 11
+        chunk = bit_string[start : start + 11]
+        seq = int(chunk, 2)
+        seqnums.append(seq)
+ 
+    return seqnums
+ 
+ 
+def make_sack(seqnum: int, window: int, timestamp: bytes, out_of_order: list) -> SRTPPacket:
+    """
+        Creates a SACK if the buffer contains out-of-sequence packets.
+        If the list is empty, returns a normal ACK 
+    """
+    if not out_of_order:
+        
+        return make_ack(seqnum, window, timestamp)
+ 
+    payload = encode_sack_payload(out_of_order)
+    return SRTPPacket(
+        ptype=PacketType.SACK,
+        window=window,
+        seqnum=seqnum % SEQ_MODULO,
+        timestamp=timestamp,
+        payload=payload,
+    )
+
 def split_file_into_chunks(data: bytes, chunk_size: int = MAX_PAYLOAD_SIZE) -> list:
     """Splits a file into blocks of up to 1024 bytes
         Each block will become the payload of a DATA packet
