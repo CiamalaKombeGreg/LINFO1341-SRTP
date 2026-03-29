@@ -14,6 +14,7 @@ from srtp_http import (
     make_data_packet,
     make_ack_for,
     split_file_into_chunks,
+    SEQ_MODULO,
 )
 
 RTO = 2.0  
